@@ -17,6 +17,7 @@ import android.media.AudioAttributes
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -53,6 +54,7 @@ class PrayerTrackerService : Service(), SensorEventListener {
         const val ACTION_STOP_PRAYER = "com.ahmed.rakaattracker.ACTION_STOP_PRAYER"
         const val ACTION_UNDO_RAKAH = "com.ahmed.rakaattracker.ACTION_UNDO_RAKAH"
         const val ACTION_START_STANDBY = "com.ahmed.rakaattracker.ACTION_START_STANDBY"
+        const val ACTION_TEST_VIBRATION = "com.ahmed.rakaattracker.ACTION_TEST_VIBRATION"
 
         private val _uiState = MutableStateFlow(TrackerUiState())
         val uiState: StateFlow<TrackerUiState> = _uiState
@@ -133,6 +135,7 @@ class PrayerTrackerService : Service(), SensorEventListener {
             ACTION_STOP_PRAYER -> stopPrayerMode()
             ACTION_UNDO_RAKAH -> handleUndoRakah()
             ACTION_START_STANDBY -> startStandbyMode()
+            ACTION_TEST_VIBRATION -> vibrateStartupMelody()
         }
         return START_STICKY
     }
@@ -271,11 +274,10 @@ class PrayerTrackerService : Service(), SensorEventListener {
                 )
             }
             Sensor.TYPE_PROXIMITY -> {
-                val res = classifier.onProximitySample(
+                classifier.onProximitySample(
                     event.values[0],
                     event.sensor.maximumRange
                 )
-                handlePostureResult(res)
             }
         }
     }
@@ -294,6 +296,7 @@ class PrayerTrackerService : Service(), SensorEventListener {
 
         val note = when {
             res.modeChangedToGround -> "تم التحويل تلقائياً لوضع الأرض (مستشعر التقارب)"
+            res.modeChangedToPocket -> "تم العودة تلقائياً لوضع الجيب"
             res.protectionBlockedReason != null -> res.protectionBlockedReason
             else -> _uiState.value.lastStatusNote
         }
@@ -341,19 +344,32 @@ class PrayerTrackerService : Service(), SensorEventListener {
     }
 
     private fun vibrateWaveform(timings: LongArray, amplitudes: IntArray) {
-        val effect = VibrationEffect.createWaveform(timings, amplitudes, -1)
-        val attrs = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_ALARM)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-            .build()
-        @Suppress("DEPRECATION")
-        vibrator.vibrate(effect, attrs)
+        if (!vibrator.hasVibrator()) return
+        val effect = if (vibrator.hasAmplitudeControl()) {
+            VibrationEffect.createWaveform(timings, amplitudes, -1)
+        } else {
+            // Devices without amplitude control (like Redmi 9) fail or stay silent if custom amplitudes are passed
+            VibrationEffect.createWaveform(timings, -1)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val vAttrs = VibrationAttributes.Builder()
+                .setUsage(VibrationAttributes.USAGE_ALARM)
+                .build()
+            vibrator.vibrate(effect, vAttrs)
+        } else {
+            val attrs = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(effect, attrs)
+        }
     }
 
     private fun enableDndSilence() {
         if (notificationManager.isNotificationPolicyAccessGranted) {
             previousDndFilter = notificationManager.currentInterruptionFilter
-            notificationManager.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_NONE)
+            notificationManager.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALARMS)
         }
     }
 

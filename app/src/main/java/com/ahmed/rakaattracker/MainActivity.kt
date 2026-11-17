@@ -194,6 +194,18 @@ fun RakaatTrackerHomeScreen() {
                             ) {
                                 Text("إلغاء العدة")
                             }
+                        } else {
+                            OutlinedButton(
+                                onClick = {
+                                    context.startService(
+                                        Intent(context, PrayerTrackerService::class.java).apply {
+                                            action = PrayerTrackerService.ACTION_TEST_VIBRATION
+                                        }
+                                    )
+                                }
+                            ) {
+                                Text("تجربة الهزاز")
+                            }
                         }
                     }
                 }

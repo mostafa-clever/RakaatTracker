@@ -37,14 +37,16 @@ data class PostureEvent(
     val verticalDropScore: Float,
     val trackingMode: TrackingMode = TrackingMode.POCKET_MOTION,
     val modeChangedToGround: Boolean = false,
+    val modeChangedToPocket: Boolean = false,
     val protectionBlockedReason: String? = null
 )
 
 /**
  * Dual-mode classifier:
  * 1) POCKET_MOTION: Uses gravity tilt + vertical linear acceleration.
- * 2) GROUND_PROXIMITY: Auto-activates when phone is flat, still, and uncovered; uses proximity sensor
- *    to detect Sujud when the user's chest/face approaches the phone on the prayer mat.
+ * 2) GROUND_PROXIMITY: Auto-activates after 3.5s flat+still+uncovered, and switches back to
+ *    POCKET_MOTION if picked up / tilted upright for 1.5s. Proximity debounce is evaluated
+ *    continuously inside onGravitySample() because TYPE_PROXIMITY is an on-change sensor.
  */
 class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
 
@@ -76,11 +78,16 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
     private var lastSujud1Ms: Long = 0L
     private var motionVarianceEma = 0f
     private var alertedForCurrentRakah = false
+    private var sujud2CompletedForCurrentRakah = false
 
-    private var isProximityNear: Boolean = false
-    private var proximityCandidateNear: Boolean? = null
-    private var proximityCandidateSinceMs: Long = 0L
+    // Proximity state (TYPE_PROXIMITY only fires on change, so we store raw state & evaluate in gravity loop)
+    private var rawProximityNear: Boolean = false
+    private var rawProximityChangedMs: Long = 0L
+    private var debouncedProximityNear: Boolean = false
+
+    // Auto mode switching timers
     private var flatUncoveredSinceMs: Long = 0L
+    private var pickedUpUprightSinceMs: Long = 0L
 
     fun reset(nowMs: Long = System.currentTimeMillis()) {
         rakahCount = 0
@@ -99,10 +106,12 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
         lastSujud1Ms = 0L
         motionVarianceEma = 0f
         alertedForCurrentRakah = false
-        isProximityNear = false
-        proximityCandidateNear = null
-        proximityCandidateSinceMs = 0L
+        sujud2CompletedForCurrentRakah = false
+        rawProximityNear = false
+        rawProximityChangedMs = nowMs
+        debouncedProximityNear = false
         flatUncoveredSinceMs = 0L
+        pickedUpUprightSinceMs = 0L
     }
 
     fun updateConfig(newConfig: TrackerConfig) {
@@ -114,6 +123,7 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
             rakahCount -= 1
         }
         alertedForCurrentRakah = true
+        sujud2CompletedForCurrentRakah = true
         currentPosture = PrayerPosture.STANDING
         candidatePosture = null
         lastRakahCountedMs = System.currentTimeMillis()
@@ -124,39 +134,12 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
         distanceCm: Float,
         maxRangeCm: Float,
         nowMs: Long = System.currentTimeMillis()
-    ): PostureEvent {
+    ) {
         val near = distanceCm < (maxRangeCm * 0.8f).coerceAtLeast(1.0f)
-
-        if (trackingMode != TrackingMode.GROUND_PROXIMITY) {
-            isProximityNear = near
-            return PostureEvent(null, currentPosture, 0f, 0f, trackingMode)
+        if (near != rawProximityNear) {
+            rawProximityNear = near
+            rawProximityChangedMs = nowMs
         }
-
-        if (near != proximityCandidateNear) {
-            proximityCandidateNear = near
-            proximityCandidateSinceMs = nowMs
-            return PostureEvent(null, currentPosture, 0f, 0f, trackingMode)
-        }
-
-        if (nowMs - proximityCandidateSinceMs < 350L) {
-            return PostureEvent(null, currentPosture, 0f, 0f, trackingMode)
-        }
-
-        if (near == isProximityNear) {
-            return PostureEvent(null, currentPosture, 0f, 0f, trackingMode)
-        }
-
-        isProximityNear = near
-        val raw = if (near) {
-            if (currentPosture == PrayerPosture.SITTING || currentPosture == PrayerPosture.SUJUD_2) {
-                PrayerPosture.SUJUD_2
-            } else {
-                PrayerPosture.SUJUD_1
-            }
-        } else {
-            PrayerPosture.SITTING
-        }
-        return applySujudStateTransition(raw, 0f, 0f, nowMs)
     }
 
     fun onGravitySample(gx: Float, gy: Float, gz: Float, nowMs: Long = System.currentTimeMillis()): PostureEvent {
@@ -164,35 +147,68 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
         hasGravity = true
 
         var switchedToGround = false
-        if (config.autoGroundModeEnabled && trackingMode == TrackingMode.POCKET_MOTION) {
-            val isFlatOnFloor = abs(gz) > 7.8f && abs(gx) < 3.5f && abs(gy) < 3.5f
-            val isStill = motionVarianceEma < 0.65f
-            val isUncovered = !isProximityNear
+        var switchedToPocket = false
 
+        val isFlatOnFloor = abs(gz) > 8.2f && abs(gx) < 3.2f && abs(gy) < 3.2f
+        val isUprightOrTilted = abs(gz) < 6.5f
+        val isStill = motionVarianceEma < 0.55f
+        val isUncovered = !rawProximityNear
+
+        // 1) Switch Pocket -> Ground only after 3.5s of flat + still + uncovered (tolerance period)
+        if (config.autoGroundModeEnabled && trackingMode == TrackingMode.POCKET_MOTION) {
             if (isFlatOnFloor && isStill && isUncovered) {
                 if (flatUncoveredSinceMs == 0L) {
                     flatUncoveredSinceMs = nowMs
-                } else if (nowMs - flatUncoveredSinceMs >= 1_500L) {
+                } else if (nowMs - flatUncoveredSinceMs >= 3_500L) {
                     trackingMode = TrackingMode.GROUND_PROXIMITY
                     currentPosture = PrayerPosture.STANDING
+                    debouncedProximityNear = rawProximityNear
                     switchedToGround = true
+                    pickedUpUprightSinceMs = 0L
                 }
             } else {
                 flatUncoveredSinceMs = 0L
             }
         }
+        // 2) Allow switching Ground -> Pocket if user picks up the phone upright for 1.5s
+        else if (trackingMode == TrackingMode.GROUND_PROXIMITY) {
+            if (isUprightOrTilted) {
+                if (pickedUpUprightSinceMs == 0L) {
+                    pickedUpUprightSinceMs = nowMs
+                } else if (nowMs - pickedUpUprightSinceMs >= 1_500L) {
+                    trackingMode = TrackingMode.POCKET_MOTION
+                    switchedToPocket = true
+                    flatUncoveredSinceMs = 0L
+                    if (rakahCount == 0) {
+                        refGravity = floatArrayOf(gx, gy, gz)
+                        currentPosture = PrayerPosture.STANDING
+                    }
+                }
+            } else {
+                pickedUpUprightSinceMs = 0L
+            }
+        }
 
+        // 3) If in Ground Mode, evaluate debounced proximity inside this continuous 50Hz loop
         if (trackingMode == TrackingMode.GROUND_PROXIMITY) {
+            if (rawProximityNear != debouncedProximityNear && (nowMs - rawProximityChangedMs) >= 350L) {
+                debouncedProximityNear = rawProximityNear
+                val raw = if (debouncedProximityNear) PrayerPosture.SUJUD_1 else PrayerPosture.SITTING
+                val ev = applySujudStateTransition(raw, 0f, 0f, nowMs)
+                return ev.copy(modeChangedToGround = switchedToGround)
+            }
             return PostureEvent(
                 newRakahCount = null,
                 posture = currentPosture,
                 tiltDegrees = 0f,
                 verticalDropScore = 0f,
                 trackingMode = trackingMode,
-                modeChangedToGround = switchedToGround
+                modeChangedToGround = switchedToGround,
+                modeChangedToPocket = switchedToPocket
             )
         }
 
+        // 4) Pocket Motion calibration & detection
         if (refGravity == null) {
             calibSamples.add(floatArrayOf(gx, gy, gz))
             if (nowMs - startTimeMs >= 1_200L && calibSamples.isNotEmpty()) {
@@ -206,7 +222,14 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
                 refGravity = floatArrayOf(avg[0] / n, avg[1] / n, avg[2] / n)
                 currentPosture = PrayerPosture.STANDING
             } else {
-                return PostureEvent(null, PrayerPosture.CALIBRATING, 0f, recentDownwardDropScore, trackingMode)
+                return PostureEvent(
+                    null,
+                    PrayerPosture.CALIBRATING,
+                    0f,
+                    recentDownwardDropScore,
+                    trackingMode,
+                    modeChangedToPocket = switchedToPocket
+                )
             }
         }
 
@@ -215,7 +238,8 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
         val activeDropScore = if (dropAgeMs <= 4_500L) recentDownwardDropScore else 0f
 
         val rawDetected = classifyRawPosture(tiltDeg, activeDropScore)
-        return advancePocketStateMachine(rawDetected, tiltDeg, activeDropScore, nowMs)
+        val ev = advancePocketStateMachine(rawDetected, tiltDeg, activeDropScore, nowMs)
+        return if (switchedToPocket) ev.copy(modeChangedToPocket = true) else ev
     }
 
     fun onLinearAccelerationSample(
@@ -259,14 +283,13 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
 
         return when {
             tiltDeg >= sujudAngle || (tiltDeg >= sujudAngle - 12f && dropScore >= config.dropImpulseThreshold) -> {
-                if (currentPosture == PrayerPosture.SITTING || currentPosture == PrayerPosture.SUJUD_2) {
-                    PrayerPosture.SUJUD_2
-                } else {
-                    PrayerPosture.SUJUD_1
-                }
+                PrayerPosture.SUJUD_1
             }
             tiltDeg >= rukuAngle -> {
-                if (currentPosture == PrayerPosture.SUJUD_1 || currentPosture == PrayerPosture.SITTING) {
+                if (currentPosture == PrayerPosture.SUJUD_1 ||
+                    currentPosture == PrayerPosture.SITTING ||
+                    currentPosture == PrayerPosture.SUJUD_2
+                ) {
                     PrayerPosture.SITTING
                 } else {
                     PrayerPosture.RUKU
@@ -315,24 +338,28 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
                 val timeSinceSujud1 = nowMs - lastSujud1Ms
 
                 when {
-                    currentPosture == PrayerPosture.SITTING && timeSinceSujud1 < 18_000L -> {
+                    // Second sujud of the same rak'ah
+                    rakahCount > 0 && !sujud2CompletedForCurrentRakah && timeSinceSujud1 < 20_000L -> {
+                        sujud2CompletedForCurrentRakah = true
                         currentPosture = PrayerPosture.SUJUD_2
                         if (config.vibrationTiming == VibrationTiming.SECOND_SUJUD &&
-                            !alertedForCurrentRakah &&
-                            rakahCount > 0
+                            !alertedForCurrentRakah
                         ) {
                             notifyRakah = rakahCount
                             alertedForCurrentRakah = true
                         }
                     }
+                    // Automatic protection: rak'ah too short
                     lastRakahCountedMs != 0L && timeSinceLastRakah < config.minRakahDurationMs -> {
                         blockedReason = "حماية تلقائية: مدة الركعة أقل من ${config.minRakahDurationMs / 1000} ثوانٍ"
                         currentPosture = PrayerPosture.SUJUD_2
                     }
+                    // New rak'ah!
                     else -> {
                         rakahCount += 1
                         lastRakahCountedMs = nowMs
                         lastSujud1Ms = nowMs
+                        sujud2CompletedForCurrentRakah = false
                         currentPosture = PrayerPosture.SUJUD_1
                         alertedForCurrentRakah = false
                         if (config.vibrationTiming == VibrationTiming.FIRST_SUJUD) {
@@ -344,13 +371,6 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
             }
             PrayerPosture.SUJUD_2 -> {
                 currentPosture = PrayerPosture.SUJUD_2
-                if (config.vibrationTiming == VibrationTiming.SECOND_SUJUD &&
-                    !alertedForCurrentRakah &&
-                    rakahCount > 0
-                ) {
-                    notifyRakah = rakahCount
-                    alertedForCurrentRakah = true
-                }
             }
             PrayerPosture.SITTING -> {
                 currentPosture = PrayerPosture.SITTING
@@ -373,7 +393,7 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
             PrayerPosture.CALIBRATING -> Unit
         }
 
-        return PostureEvent(notifyRakah, currentPosture, tiltDeg, dropScore, trackingMode, false, blockedReason)
+        return PostureEvent(notifyRakah, currentPosture, tiltDeg, dropScore, trackingMode, false, false, blockedReason)
     }
 
     private fun computeTiltDegrees(v1: FloatArray, v2: FloatArray): Float {
