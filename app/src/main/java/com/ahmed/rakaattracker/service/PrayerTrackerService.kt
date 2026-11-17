@@ -218,6 +218,17 @@ class PrayerTrackerService : Service(), SensorEventListener {
         updateNotification("وضع الصلاة نشط — الركعة: $updatedCount")
     }
 
+    private fun registerScreenReceiverIfNeeded() {
+        if (!screenReceiverRegistered) {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+            }
+            registerReceiver(screenReceiver, filter)
+            screenReceiverRegistered = true
+        }
+    }
+
     private fun registerSensors() {
         val gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
             ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
