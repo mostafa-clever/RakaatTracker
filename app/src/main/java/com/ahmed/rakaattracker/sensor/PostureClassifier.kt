@@ -7,7 +7,7 @@ import kotlin.math.sqrt
 
 enum class TrackingMode(val labelAr: String) {
     POCKET_MOTION("وضع الجيب (الحركة والميل)"),
-    GROUND_PROXIMITY("وضع الأرض (مستشعر التقارب)")
+    GROUND_PROXIMITY("وضع الأرض (الظل والتقارب)")
 }
 
 enum class PrayerPosture(val labelAr: String) {
@@ -45,8 +45,8 @@ data class PostureEvent(
  * Dual-mode classifier:
  * 1) POCKET_MOTION: Uses gravity tilt + vertical linear acceleration.
  * 2) GROUND_PROXIMITY: Auto-activates after 3.5s flat+still+uncovered, and switches back to
- *    POCKET_MOTION if picked up / tilted upright for 1.5s. Proximity debounce is evaluated
- *    continuously inside onGravitySample() because TYPE_PROXIMITY is an on-change sensor.
+ *    POCKET_MOTION if picked up / tilted upright for 1.5s.
+ *    Detects Sujud using BOTH Ambient Light shadow drop (works at 20-50cm!) and Proximity sensor.
  */
 class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
 
@@ -80,10 +80,13 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
     private var alertedForCurrentRakah = false
     private var sujud2CompletedForCurrentRakah = false
 
-    // Proximity state (TYPE_PROXIMITY only fires on change, so we store raw state & evaluate in gravity loop)
+    // Ground mode: Proximity + Ambient Light shadow detection
     private var rawProximityNear: Boolean = false
-    private var rawProximityChangedMs: Long = 0L
-    private var debouncedProximityNear: Boolean = false
+    private var currentLux: Float = -1f
+    private var baselineLux: Float = -1f
+    private var rawGroundSujud: Boolean = false
+    private var rawGroundSujudChangedMs: Long = 0L
+    private var debouncedGroundSujud: Boolean = false
 
     // Auto mode switching timers
     private var flatUncoveredSinceMs: Long = 0L
@@ -108,8 +111,11 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
         alertedForCurrentRakah = false
         sujud2CompletedForCurrentRakah = false
         rawProximityNear = false
-        rawProximityChangedMs = nowMs
-        debouncedProximityNear = false
+        currentLux = -1f
+        baselineLux = -1f
+        rawGroundSujud = false
+        rawGroundSujudChangedMs = nowMs
+        debouncedGroundSujud = false
         flatUncoveredSinceMs = 0L
         pickedUpUprightSinceMs = 0L
     }
@@ -135,10 +141,37 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
         maxRangeCm: Float,
         nowMs: Long = System.currentTimeMillis()
     ) {
-        val near = distanceCm < (maxRangeCm * 0.8f).coerceAtLeast(1.0f)
-        if (near != rawProximityNear) {
-            rawProximityNear = near
-            rawProximityChangedMs = nowMs
+        rawProximityNear = distanceCm < (maxRangeCm * 0.8f).coerceAtLeast(1.0f)
+        updateGroundSujudSignal(nowMs)
+    }
+
+    fun onLightSample(lux: Float, nowMs: Long = System.currentTimeMillis()) {
+        currentLux = lux
+        if (trackingMode == TrackingMode.GROUND_PROXIMITY) {
+            // Slowly adapt baseline upward when uncovered/not in sujud
+            if (!debouncedGroundSujud && lux > 3f) {
+                baselineLux = if (baselineLux < 0f) lux else (0.92f * baselineLux + 0.08f * lux)
+            }
+            updateGroundSujudSignal(nowMs)
+        } else {
+            baselineLux = if (baselineLux < 0f) lux else (0.85f * baselineLux + 0.15f * lux)
+        }
+    }
+
+    private fun updateGroundSujudSignal(nowMs: Long) {
+        val shadowDetected = baselineLux > 5f && currentLux >= 0f && (currentLux < baselineLux * 0.42f)
+        val shadowCleared = baselineLux <= 5f || currentLux >= baselineLux * 0.65f
+
+        val nextSignal = when {
+            rawProximityNear -> true
+            shadowDetected -> true
+            rawGroundSujud && !shadowCleared -> true // Hysteresis band
+            else -> false
+        }
+
+        if (nextSignal != rawGroundSujud) {
+            rawGroundSujud = nextSignal
+            rawGroundSujudChangedMs = nowMs
         }
     }
 
@@ -154,7 +187,7 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
         val isStill = motionVarianceEma < 0.55f
         val isUncovered = !rawProximityNear
 
-        // 1) Switch Pocket -> Ground only after 3.5s of flat + still + uncovered (tolerance period)
+        // 1) Switch Pocket -> Ground after 3.5s of flat + still + uncovered
         if (config.autoGroundModeEnabled && trackingMode == TrackingMode.POCKET_MOTION) {
             if (isFlatOnFloor && isStill && isUncovered) {
                 if (flatUncoveredSinceMs == 0L) {
@@ -162,7 +195,9 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
                 } else if (nowMs - flatUncoveredSinceMs >= 3_500L) {
                     trackingMode = TrackingMode.GROUND_PROXIMITY
                     currentPosture = PrayerPosture.STANDING
-                    debouncedProximityNear = rawProximityNear
+                    if (currentLux > 3f) baselineLux = currentLux
+                    rawGroundSujud = false
+                    debouncedGroundSujud = false
                     switchedToGround = true
                     pickedUpUprightSinceMs = 0L
                 }
@@ -170,7 +205,7 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
                 flatUncoveredSinceMs = 0L
             }
         }
-        // 2) Allow switching Ground -> Pocket if user picks up the phone upright for 1.5s
+        // 2) Switch Ground -> Pocket if picked up upright for 1.5s
         else if (trackingMode == TrackingMode.GROUND_PROXIMITY) {
             if (isUprightOrTilted) {
                 if (pickedUpUprightSinceMs == 0L) {
@@ -189,11 +224,11 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
             }
         }
 
-        // 3) If in Ground Mode, evaluate debounced proximity inside this continuous 50Hz loop
+        // 3) Evaluate Ground Mode (Shadow + Proximity) inside continuous 50Hz loop
         if (trackingMode == TrackingMode.GROUND_PROXIMITY) {
-            if (rawProximityNear != debouncedProximityNear && (nowMs - rawProximityChangedMs) >= 350L) {
-                debouncedProximityNear = rawProximityNear
-                val raw = if (debouncedProximityNear) PrayerPosture.SUJUD_1 else PrayerPosture.SITTING
+            if (rawGroundSujud != debouncedGroundSujud && (nowMs - rawGroundSujudChangedMs) >= 350L) {
+                debouncedGroundSujud = rawGroundSujud
+                val raw = if (debouncedGroundSujud) PrayerPosture.SUJUD_1 else PrayerPosture.SITTING
                 val ev = applySujudStateTransition(raw, 0f, 0f, nowMs)
                 return ev.copy(modeChangedToGround = switchedToGround)
             }
@@ -338,7 +373,6 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
                 val timeSinceSujud1 = nowMs - lastSujud1Ms
 
                 when {
-                    // Second sujud of the same rak'ah
                     rakahCount > 0 && !sujud2CompletedForCurrentRakah && timeSinceSujud1 < 20_000L -> {
                         sujud2CompletedForCurrentRakah = true
                         currentPosture = PrayerPosture.SUJUD_2
@@ -349,12 +383,10 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
                             alertedForCurrentRakah = true
                         }
                     }
-                    // Automatic protection: rak'ah too short
                     lastRakahCountedMs != 0L && timeSinceLastRakah < config.minRakahDurationMs -> {
                         blockedReason = "حماية تلقائية: مدة الركعة أقل من ${config.minRakahDurationMs / 1000} ثوانٍ"
                         currentPosture = PrayerPosture.SUJUD_2
                     }
-                    // New rak'ah!
                     else -> {
                         rakahCount += 1
                         lastRakahCountedMs = nowMs
@@ -389,6 +421,14 @@ class PostureClassifier(private var config: TrackerConfig = TrackerConfig()) {
             }
             PrayerPosture.STANDING -> {
                 currentPosture = PrayerPosture.STANDING
+                // Fallback: if user stood up directly from SUJUD_1 skipping SITTING angle, still fire!
+                if (config.vibrationTiming == VibrationTiming.SITTING_BETWEEN_SUJUDS &&
+                    !alertedForCurrentRakah &&
+                    rakahCount > 0
+                ) {
+                    notifyRakah = rakahCount
+                    alertedForCurrentRakah = true
+                }
             }
             PrayerPosture.CALIBRATING -> Unit
         }

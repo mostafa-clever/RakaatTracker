@@ -237,6 +237,7 @@ class PrayerTrackerService : Service(), SensorEventListener {
             ?: sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         val linearAccelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
         val proximitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_PROXIMITY)
+        val lightSensor = sensorManager.getDefaultSensor(Sensor.TYPE_LIGHT)
 
         gravitySensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
@@ -245,6 +246,9 @@ class PrayerTrackerService : Service(), SensorEventListener {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
         proximitySensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+        }
+        lightSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
@@ -278,6 +282,9 @@ class PrayerTrackerService : Service(), SensorEventListener {
                     event.values[0],
                     event.sensor.maximumRange
                 )
+            }
+            Sensor.TYPE_LIGHT -> {
+                classifier.onLightSample(event.values[0])
             }
         }
     }
