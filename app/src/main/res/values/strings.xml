@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">متابع الركعات</string>
+    <string name="accessibility_service_description">يسمح للتطبيق بالتقاط ضغطات أزرار الصوت (3 ضغطات لبدء الصلاة، وضغطة لإلغاء العدة الخاطئة) حتى خارج التطبيق.</string>
+</resources>
